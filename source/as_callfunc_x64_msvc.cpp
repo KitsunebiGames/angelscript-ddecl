@@ -51,6 +51,16 @@ extern "C" asQWORD CallX64(const asQWORD *args, const asQWORD *floatArgs, int pa
 extern "C" asDWORD GetReturnedFloat();
 extern "C" asQWORD GetReturnedDouble();
 
+bool shouldFlipArgs(int callConv) {
+	return (
+		callConv == ICC_DDECL ||
+		callConv == ICC_DDECL_RETURNINMEM ||
+		callConv == ICC_DDECL_OBJFIRST ||
+		callConv == ICC_DDECL_OBJFIRST_RETURNINMEM ||
+		callConv == ICC_DDECL_OBJLAST ||
+		callConv == ICC_DDECL_OBJLAST_RETURNINMEM);
+}
+
 asQWORD CallSystemFunctionNative(asCContext *context, asCScriptFunction *descr, void *obj, asDWORD *args, void *retPointer, asQWORD &/*retQW2*/, void *secondObject)
 {
 	asCScriptEngine *engine = context->m_engine;
@@ -83,12 +93,20 @@ asQWORD CallSystemFunctionNative(asCContext *context, asCScriptFunction *descr, 
 		allArgBuffer[paramSize++] = (asQWORD)retPointer;
 	}
 
-	if( callConv == ICC_CDECL_OBJFIRST ||
-		callConv == ICC_CDECL_OBJFIRST_RETURNINMEM )
+	if (callConv == ICC_CDECL_OBJFIRST ||
+		callConv == ICC_CDECL_OBJFIRST_RETURNINMEM)
 	{
 		// Add the object pointer as the first parameter
 		allArgBuffer[paramSize++] = (asQWORD)obj;
 	}
+
+	else if (callConv == ICC_DDECL_OBJLAST ||
+		callConv == ICC_DDECL_OBJLAST_RETURNINMEM)
+	{
+		// Add the object pointer as the first parameter
+		allArgBuffer[paramSize++] = (asQWORD)obj;
+	}
+
 	else if( callConv == ICC_THISCALL_OBJFIRST ||
 		callConv == ICC_THISCALL_OBJFIRST_RETURNINMEM ||
 		callConv == ICC_VIRTUAL_THISCALL_OBJFIRST ||
@@ -113,70 +131,181 @@ asQWORD CallSystemFunctionNative(asCContext *context, asCScriptFunction *descr, 
 	// Move the arguments to the buffer
 	asUINT dpos = paramSize;
 	asUINT spos = 0;
-	for( asUINT n = 0; n < descr->parameterTypes.GetLength(); n++ )
-	{
-		asCDataType &dt = descr->parameterTypes[n];
-		if( dt.IsObject() && !dt.IsObjectHandle() && !dt.IsReference() )
+
+	if (shouldFlipArgs(callConv)) {
+
+		// We want spos to be recalculated to be the entire stack size
+		for (asUINT n = 0; n < descr->parameterTypes.GetLength(); n++)
 		{
-			if( dt.GetSizeInMemoryDWords() >= AS_LARGE_OBJ_MIN_SIZE ||
-				(dt.GetTypeInfo()->flags & COMPLEX_MASK) )
+			asCDataType &dt = descr->parameterTypes[n];
+			if (dt.IsObject() && !dt.IsObjectHandle() && !dt.IsReference())
 			{
-				allArgBuffer[dpos++] = *(asQWORD*)&args[spos];
-				spos += AS_PTR_SIZE;
-				paramSize++;
+				if (dt.GetSizeInMemoryDWords() >= AS_LARGE_OBJ_MIN_SIZE ||
+					(dt.GetTypeInfo()->flags & COMPLEX_MASK))
+				{
+					spos += AS_PTR_SIZE;
+				}
+				else
+				{
+					spos += AS_PTR_SIZE;
+				}
 			}
-			else
+			else if (dt.GetTokenType() == ttQuestion)
 			{
-				// Copy the object's memory to the buffer
-				memcpy(&allArgBuffer[dpos], *(void**)(args+spos), dt.GetSizeInMemoryBytes());
-
-				// Delete the original memory
-				engine->CallFree(*(char**)(args+spos));
-				spos += AS_PTR_SIZE;
-				asUINT dwords = dt.GetSizeInMemoryDWords();
-				asUINT qwords = (dwords >> 1) + (dwords & 1);
-				dpos      += qwords;
-				paramSize += qwords;
-			}
-		}
-		else if( dt.GetTokenType() == ttQuestion )
-		{
-			// Copy the reference and the type id
-			allArgBuffer[dpos++] = *(asQWORD*)&args[spos];
-			spos += 2;
-			allArgBuffer[dpos++] = args[spos++];
-			paramSize += 2;
-		}
-		else
-		{
-			// Copy the value directly
-			asUINT dwords = dt.GetSizeOnStackDWords();
-			if( dwords > 1 )
-			{
-				allArgBuffer[dpos] = *(asQWORD*)&args[spos];
-
-				// Double arguments are moved to a separate buffer in order to be placed in the XMM registers,
-				// though this is only done for first 4 arguments, the rest are placed on the stack
-				if( paramSize < 4 && dt.IsDoubleType() )
-					floatArgBuffer[dpos] = *(asQWORD*)&args[spos];
-
-				dpos++;
 				spos += 2;
-			}
-			else
-			{
-				allArgBuffer[dpos] = args[spos];
-
-				// Float arguments are moved to a separate buffer in order to be placed in the XMM registers,
-				// though this is only done for first 4 arguments, the rest are placed on the stack
-				if( paramSize < 4 && dt.IsFloatType() )
-					floatArgBuffer[dpos] = args[spos];
-				
-				dpos++;
 				spos++;
 			}
+			else
+			{
+				// Copy the value directly
+				asUINT dwords = dt.GetSizeOnStackDWords();
+				if (dwords > 1)
+				{
+					spos += 2;
+				}
+				else
+				{
+					spos++;
+				}
+			}
+		}
 
-			paramSize++;
+		for (asUINT n = 0; n < descr->parameterTypes.GetLength(); n++)
+		{
+			asCDataType &dt = descr->parameterTypes[n];
+			if (dt.IsObject() && !dt.IsObjectHandle() && !dt.IsReference())
+			{
+				if (dt.GetSizeInMemoryDWords() >= AS_LARGE_OBJ_MIN_SIZE ||
+					(dt.GetTypeInfo()->flags & COMPLEX_MASK))
+				{
+					spos -= AS_PTR_SIZE;
+					allArgBuffer[dpos++] = *(asQWORD*)&args[spos];
+					paramSize++;
+				}
+				else
+				{
+					spos -= AS_PTR_SIZE;
+
+					// Copy the object's memory to the buffer
+					memcpy(&allArgBuffer[dpos], *(void**)(args + spos), dt.GetSizeInMemoryBytes());
+
+					// Delete the original memory
+					engine->CallFree(*(char**)(args + spos));
+					asUINT dwords = dt.GetSizeInMemoryDWords();
+					asUINT qwords = (dwords >> 1) + (dwords & 1);
+					dpos += qwords;
+					paramSize += qwords;
+				}
+			}
+			else if (dt.GetTokenType() == ttQuestion)
+			{
+				// Copy the reference and the type id
+				spos -= 2;
+				allArgBuffer[dpos++] = *(asQWORD*)&args[spos];
+				allArgBuffer[dpos++] = args[--spos];
+				paramSize += 2;
+			}
+			else
+			{
+				// Copy the value directly
+				asUINT dwords = dt.GetSizeOnStackDWords();
+				if (dwords > 1)
+				{
+					spos -= 2;
+
+					allArgBuffer[dpos] = *(asQWORD*)&args[spos];
+
+					// Double arguments are moved to a separate buffer in order to be placed in the XMM registers,
+					// though this is only done for first 4 arguments, the rest are placed on the stack
+					if (paramSize < 4 && dt.IsDoubleType())
+						floatArgBuffer[dpos] = *(asQWORD*)&args[spos];
+
+					dpos++;
+				}
+				else
+				{
+					spos--;
+
+					allArgBuffer[dpos] = args[spos];
+
+					// Float arguments are moved to a separate buffer in order to be placed in the XMM registers,
+					// though this is only done for first 4 arguments, the rest are placed on the stack
+					if (paramSize < 4 && dt.IsFloatType())
+						floatArgBuffer[dpos] = args[spos];
+
+					dpos++;
+				}
+
+				paramSize++;
+			}
+		}
+	}
+	else {
+		for (asUINT n = 0; n < descr->parameterTypes.GetLength(); n++)
+		{
+			asCDataType &dt = descr->parameterTypes[n];
+			if (dt.IsObject() && !dt.IsObjectHandle() && !dt.IsReference())
+			{
+				if (dt.GetSizeInMemoryDWords() >= AS_LARGE_OBJ_MIN_SIZE ||
+					(dt.GetTypeInfo()->flags & COMPLEX_MASK))
+				{
+					allArgBuffer[dpos++] = *(asQWORD*)&args[spos];
+					spos += AS_PTR_SIZE;
+					paramSize++;
+				}
+				else
+				{
+					// Copy the object's memory to the buffer
+					memcpy(&allArgBuffer[dpos], *(void**)(args + spos), dt.GetSizeInMemoryBytes());
+
+					// Delete the original memory
+					engine->CallFree(*(char**)(args + spos));
+					spos += AS_PTR_SIZE;
+					asUINT dwords = dt.GetSizeInMemoryDWords();
+					asUINT qwords = (dwords >> 1) + (dwords & 1);
+					dpos += qwords;
+					paramSize += qwords;
+				}
+			}
+			else if (dt.GetTokenType() == ttQuestion)
+			{
+				// Copy the reference and the type id
+				allArgBuffer[dpos++] = *(asQWORD*)&args[spos];
+				spos += 2;
+				allArgBuffer[dpos++] = args[spos++];
+				paramSize += 2;
+			}
+			else
+			{
+				// Copy the value directly
+				asUINT dwords = dt.GetSizeOnStackDWords();
+				if (dwords > 1)
+				{
+					allArgBuffer[dpos] = *(asQWORD*)&args[spos];
+
+					// Double arguments are moved to a separate buffer in order to be placed in the XMM registers,
+					// though this is only done for first 4 arguments, the rest are placed on the stack
+					if (paramSize < 4 && dt.IsDoubleType())
+						floatArgBuffer[dpos] = *(asQWORD*)&args[spos];
+
+					dpos++;
+					spos += 2;
+				}
+				else
+				{
+					allArgBuffer[dpos] = args[spos];
+
+					// Float arguments are moved to a separate buffer in order to be placed in the XMM registers,
+					// though this is only done for first 4 arguments, the rest are placed on the stack
+					if (paramSize < 4 && dt.IsFloatType())
+						floatArgBuffer[dpos] = args[spos];
+
+					dpos++;
+					spos++;
+				}
+
+				paramSize++;
+			}
 		}
 	}
 
@@ -184,6 +313,12 @@ asQWORD CallSystemFunctionNative(asCContext *context, asCScriptFunction *descr, 
 		callConv == ICC_CDECL_OBJLAST_RETURNINMEM )
 	{
 		// Add the object pointer as the last parameter
+		allArgBuffer[paramSize++] = (asQWORD)obj;
+	}
+	else if (callConv == ICC_DDECL_OBJFIRST ||
+		callConv == ICC_DDECL_OBJFIRST_RETURNINMEM)
+	{
+		// Add the object pointer as the first parameter
 		allArgBuffer[paramSize++] = (asQWORD)obj;
 	}
 	else if( callConv == ICC_THISCALL_OBJLAST ||
